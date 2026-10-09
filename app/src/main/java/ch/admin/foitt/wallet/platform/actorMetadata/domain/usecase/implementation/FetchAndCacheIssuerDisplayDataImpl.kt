@@ -3,9 +3,11 @@ package ch.admin.foitt.wallet.platform.actorMetadata.domain.usecase.implementati
 import ch.admin.foitt.openid4vc.domain.model.anycredential.AnyCredential
 import ch.admin.foitt.openid4vc.domain.model.credentialoffer.metadata.AnyCredentialConfiguration
 import ch.admin.foitt.openid4vc.domain.model.credentialoffer.metadata.IssuerCredentialInfo
+import ch.admin.foitt.openid4vc.domain.model.vcSdJwt.VcSdJwt
 import ch.admin.foitt.wallet.platform.actorMetadata.domain.model.ActorMetaDataError
 import ch.admin.foitt.wallet.platform.actorMetadata.domain.model.FetchAndCacheIssuerDisplayDataError
 import ch.admin.foitt.wallet.platform.actorMetadata.domain.model.toFetchAndCacheIssuerDisplayDataError
+import ch.admin.foitt.wallet.platform.actorMetadata.domain.usecase.ActorUpdateGate
 import ch.admin.foitt.wallet.platform.actorMetadata.domain.usecase.CacheIssuerDisplayData
 import ch.admin.foitt.wallet.platform.actorMetadata.domain.usecase.FetchAndCacheIssuerDisplayData
 import ch.admin.foitt.wallet.platform.credential.domain.model.AnyIssuerDisplay
@@ -13,6 +15,7 @@ import ch.admin.foitt.wallet.platform.credential.domain.model.FetchTrustForIssua
 import ch.admin.foitt.wallet.platform.credential.domain.model.GetAllAnyCredentialsByCredentialIdError
 import ch.admin.foitt.wallet.platform.credential.domain.usecase.FetchTrustForIssuance
 import ch.admin.foitt.wallet.platform.credential.domain.usecase.GetAllAnyCredentialsByCredentialId
+import ch.admin.foitt.wallet.platform.navigation.domain.model.ComponentScope
 import ch.admin.foitt.wallet.platform.ssi.domain.model.CredentialIssuerDisplayRepositoryError
 import ch.admin.foitt.wallet.platform.ssi.domain.model.CredentialRepositoryError
 import ch.admin.foitt.wallet.platform.ssi.domain.model.RawCredentialDataRepositoryError
@@ -26,6 +29,11 @@ import ch.admin.foitt.wallet.platform.trustRegistry.domain.usecase.ProcessIdenti
 import ch.admin.foitt.wallet.platform.utils.JsonParsingError
 import ch.admin.foitt.wallet.platform.utils.SafeJson
 import ch.admin.foitt.wallet.platform.utils.decompress
+import ch.admin.foitt.wallet.platform.veranaTrust.domain.model.VeranaTrustEvidence
+import ch.admin.foitt.wallet.platform.veranaTrust.domain.model.VeranaTrustResolution
+import ch.admin.foitt.wallet.platform.veranaTrust.domain.model.VeranaTrustRole
+import ch.admin.foitt.wallet.platform.veranaTrust.domain.model.VeranaTrustStatus
+import ch.admin.foitt.wallet.platform.veranaTrust.domain.usecase.EvaluateVeranaTrust
 import com.github.michaelbull.result.Err
 import com.github.michaelbull.result.Result
 import com.github.michaelbull.result.coroutines.coroutineBinding
@@ -40,13 +48,17 @@ internal class FetchAndCacheIssuerDisplayDataImpl @Inject constructor(
     private val processIdentityTrustStatement: ProcessIdentityTrustStatement,
     private val credentialRepository: CredentialRepo,
     private val fetchTrustForIssuance: FetchTrustForIssuance,
+    private val evaluateVeranaTrust: EvaluateVeranaTrust,
     private val credentialIssuerDisplayRepo: CredentialIssuerDisplayRepo,
     private val cacheIssuerDisplayData: CacheIssuerDisplayData,
+    private val actorUpdateGate: ActorUpdateGate,
 ) : FetchAndCacheIssuerDisplayData {
     override suspend operator fun invoke(
         credentialId: Long,
     ): Result<Unit, FetchAndCacheIssuerDisplayDataError> = coroutineBinding {
-        val anyCredential = getAnyCredential(credentialId).bind()
+        val actorUpdateGeneration = actorUpdateGate.begin(ComponentScope.CredentialIssuer)
+        val anyCredentials = getAnyCredentials(credentialId).bind()
+        val anyCredential = anyCredentials.first()
         val issuerCredentialInfo = getIssuerCredentialInfo(credentialId).bind()
 
         // check status list again to make sure the identity trust is still valid
@@ -64,6 +76,7 @@ internal class FetchAndCacheIssuerDisplayDataImpl @Inject constructor(
             vcSchemaId = anyCredential.vcSchemaId,
         ).mapError(FetchTrustForIssuanceError::toFetchAndCacheIssuerDisplayDataError)
             .bind()
+        val veranaTrustEvidence = evaluateVeranaTrust(anyCredentials)
 
         val savedIssuerDisplays = credentialIssuerDisplayRepo.getIssuerDisplays(credentialId)
             .mapError(CredentialIssuerDisplayRepositoryError::toFetchAndCacheIssuerDisplayDataError)
@@ -86,23 +99,57 @@ internal class FetchAndCacheIssuerDisplayDataImpl @Inject constructor(
             )
         }
 
-        cacheIssuerDisplayData(
-            trustCheckResult = trustCheckResult,
-            issuerDisplays = localizedIssuerDisplays,
-            nonComplianceData = trustCheckResult?.nonComplianceData ?: UNKNOWN_NON_COMPLIANCE_DATA,
-        )
+        actorUpdateGate.publishIfCurrent(
+            componentScope = ComponentScope.CredentialIssuer,
+            generation = actorUpdateGeneration,
+        ) {
+            cacheIssuerDisplayData(
+                trustCheckResult = trustCheckResult,
+                issuerDisplays = localizedIssuerDisplays,
+                nonComplianceData = trustCheckResult?.nonComplianceData ?: UNKNOWN_NON_COMPLIANCE_DATA,
+                veranaTrustEvidence = veranaTrustEvidence,
+            )
+        }
     }
 
-    private suspend fun getAnyCredential(
+    private suspend fun getAnyCredentials(
         credentialId: Long
-    ): Result<AnyCredential, FetchAndCacheIssuerDisplayDataError> = coroutineBinding {
+    ): Result<List<AnyCredential>, FetchAndCacheIssuerDisplayDataError> = coroutineBinding {
         val anyCredentials = getAllAnyCredentialsByCredentialId(credentialId)
             .mapError(GetAllAnyCredentialsByCredentialIdError::toFetchAndCacheIssuerDisplayDataError)
             .bind()
 
         runSuspendCatching {
-            anyCredentials.first()
+            check(anyCredentials.isNotEmpty()) { "no credential stored for $credentialId" }
+            anyCredentials
         }.mapError { ActorMetaDataError.Unexpected(it) }.bind()
+    }
+
+    private suspend fun evaluateVeranaTrust(anyCredentials: List<AnyCredential>): VeranaTrustEvidence? {
+        val issuers = anyCredentials.map { it.issuer }.distinct()
+        val issuerDid = issuers.firstOrNull { it.startsWith(DID_PREFIX) } ?: return null
+        val vcSdJwts = anyCredentials.map { it as? VcSdJwt }
+        val vcts = vcSdJwts.map { it?.vct }.distinct()
+        val certificateKeys = vcSdJwts.map { credential -> credential?.takeIf { it.isX5cIssuerKey }?.x5cPublicKey }.distinct()
+
+        val isSingleCounterparty = issuers.size == 1 && vcts.size == 1 && certificateKeys.size == 1
+
+        return if (isSingleCounterparty) {
+            evaluateVeranaTrust(
+                role = VeranaTrustRole.ISSUER,
+                did = issuerDid,
+                vct = vcts.single(),
+                certificateKey = certificateKeys.single(),
+            )
+        } else {
+            VeranaTrustEvidence(
+                role = VeranaTrustRole.ISSUER,
+                did = issuerDid,
+                vct = vcts.singleOrNull(),
+                resolution = VeranaTrustResolution.unresolved(issuerDid, VeranaTrustStatus.UNVERIFIED),
+                accreditation = null,
+            )
+        }
     }
 
     private suspend fun getIssuerCredentialInfo(
@@ -132,6 +179,7 @@ internal class FetchAndCacheIssuerDisplayDataImpl @Inject constructor(
     }
 
     private companion object {
+        const val DID_PREFIX = "did:"
         val UNKNOWN_NON_COMPLIANCE_DATA = NonComplianceData(
             state = ActorComplianceState.UNKNOWN,
             reasonDisplays = null,

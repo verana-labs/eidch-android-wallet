@@ -10,9 +10,14 @@ import ch.admin.foitt.openid4vc.domain.model.presentationRequest.RequestObject
 import ch.admin.foitt.openid4vc.domain.model.presentationRequest.RequestObjectVerificationOutcome
 import ch.admin.foitt.openid4vc.domain.model.presentationRequest.getVerificationTrustStatementJwt
 import ch.admin.foitt.openid4vc.domain.model.vcSdJwt.VcSdJwtError
+import ch.admin.foitt.openid4vc.domain.model.x509.didSubjectAlternativeName
+import ch.admin.foitt.openid4vc.domain.model.x509.dnsSubjectAlternativeNames
+import ch.admin.foitt.openid4vc.domain.model.x509.toP256Jwk
+import ch.admin.foitt.openid4vc.domain.model.x509.x5cLeafCertificate
 import ch.admin.foitt.openid4vc.domain.usecase.VerifyRequestObjectSignature
 import ch.admin.foitt.wallet.platform.actorEnvironment.domain.model.ActorEnvironment
 import ch.admin.foitt.wallet.platform.actorEnvironment.domain.usecase.GetActorEnvironment
+import ch.admin.foitt.wallet.platform.credentialPresentation.domain.model.AuthenticatedVerifier
 import ch.admin.foitt.wallet.platform.credentialPresentation.domain.model.CredentialPresentationError
 import ch.admin.foitt.wallet.platform.credentialPresentation.domain.model.PresentationRequestWithRaw
 import ch.admin.foitt.wallet.platform.credentialPresentation.domain.model.ValidatePresentationRequestError
@@ -26,6 +31,7 @@ import ch.admin.foitt.wallet.platform.trustRegistry.domain.model.VerificationQue
 import ch.admin.foitt.wallet.platform.trustRegistry.domain.usecase.ProcessIdentityTrustStatement
 import ch.admin.foitt.wallet.platform.utils.JsonParsingError
 import ch.admin.foitt.wallet.platform.utils.SafeJson
+import ch.admin.foitt.wallet.platform.veranaTrust.domain.usecase.IsVeranaTrusted
 import com.github.michaelbull.result.Err
 import com.github.michaelbull.result.Result
 import com.github.michaelbull.result.coroutines.coroutineBinding
@@ -33,6 +39,7 @@ import com.github.michaelbull.result.coroutines.runSuspendCatching
 import com.github.michaelbull.result.mapError
 import kotlinx.serialization.json.jsonPrimitive
 import uniffi.heidi_dcql_rust.DcqlQuery
+import java.net.URI
 import javax.inject.Inject
 
 class ValidatePresentationRequestImpl @Inject constructor(
@@ -42,23 +49,36 @@ class ValidatePresentationRequestImpl @Inject constructor(
     private val verifyRequestObjectSignature: VerifyRequestObjectSignature,
     private val getActorEnvironment: GetActorEnvironment,
     private val validateVqPs: ValidateVerificationQueryPublicStatement,
+    private val isVeranaTrusted: IsVeranaTrusted,
 ) : ValidatePresentationRequest {
     override suspend fun invoke(
         verificationProcessType: VerificationProcessType,
         requestObject: RequestObject
     ): Result<PresentationRequestWithRaw, ValidatePresentationRequestError> = coroutineBinding {
         val request = validateAuthorizationRequest(verificationProcessType, requestObject).bind()
-        val verifierAttestationTrusted = verifierAttestationTrusted(
+        val verificationOutcome = verifyRequestObject(
             requestObject,
             request.responseUri,
             request.state,
             verificationProcessType
         ).bind()
+        val verifierAttestationTrusted = when (verificationOutcome) {
+            RequestObjectVerificationOutcome.ATTESTATION_TRUSTED -> true
+            RequestObjectVerificationOutcome.ATTESTATION_UNTRUSTED -> false
+            RequestObjectVerificationOutcome.DID_PATH,
+            RequestObjectVerificationOutcome.X509_HASH_PATH -> null
+        }
         val idTS = if (verifierAttestationTrusted != true) {
             validateIdentityTrust(request).bind()
         } else {
             null
         }
+        val authenticatedVerifier = getAuthenticatedVerifier(
+            verificationProcessType = verificationProcessType,
+            verificationOutcome = verificationOutcome,
+            request = request,
+            jwt = requestObject.jwt,
+        )
         PresentationRequestWithRaw(
             authorizationRequest = request,
             rawPresentationRequest = requestObject.jwt.rawJwt,
@@ -67,6 +87,8 @@ class ValidatePresentationRequestImpl @Inject constructor(
             dcqlQuery = request.getDcqlQuery().bind(),
             hasVerifiedQuery = verifierAttestationTrusted == true || idTS == null || // remove idTS check when contracting TP 1.0
                 request.getVerificationTrustStatementJwt(VerificationQueryPublicStatement.TYPE) != null,
+            authenticatedVerifierDid = authenticatedVerifier?.did,
+            authenticatedVerifierCertificateKey = authenticatedVerifier?.certificateKey,
         )
     }
 
@@ -85,7 +107,7 @@ class ValidatePresentationRequestImpl @Inject constructor(
         } else {
             null
         }
-        validateJwtClaims(jwt, verificationProcessType, responseUri).bind()
+        validateJwtClaims(jwt, verificationProcessType, authorizationRequest.clientIdentifier, responseUri).bind()
 
         val isClientIdentifierValid = authorizationRequest.clientIdentifier.isValid(requestObject, verificationProcessType)
         if (jwt.type != JWT_HEADER_TYP || !isClientIdentifierValid || !authorizationRequest.isValid()) {
@@ -96,8 +118,8 @@ class ValidatePresentationRequestImpl @Inject constructor(
         }
 
         if (authorizationRequest.clientIdentifier.clientIdPrefix == ClientIdentifier.ClientIdPrefix.DecentralizedIdentifier) {
-            val verifierEnvironment = getActorEnvironment(authorizationRequest.clientIdentifier.clientId)
-            if (verifierEnvironment == ActorEnvironment.EXTERNAL) {
+            val verifierDid = authorizationRequest.clientIdentifier.clientId
+            if (getActorEnvironment(verifierDid) == ActorEnvironment.EXTERNAL && !isVeranaTrusted(verifierDid)) {
                 Err(CredentialPresentationError.UnknownRegistry(responseUri, authorizationRequest.state)).bind()
             }
         }
@@ -108,10 +130,13 @@ class ValidatePresentationRequestImpl @Inject constructor(
     private fun validateJwtClaims(
         jwt: Jwt,
         verificationProcessType: VerificationProcessType,
+        clientIdentifier: ClientIdentifier,
         responseUri: String?,
     ): Result<Unit, ValidatePresentationRequestError> = runSuspendCatching {
         check(jwt.algorithm == SignatureAlgorithm.ES256.stdName)
-        if (verificationProcessType == VerificationProcessType.NETWORK) {
+        if (verificationProcessType == VerificationProcessType.NETWORK &&
+            clientIdentifier.clientIdPrefix != ClientIdentifier.ClientIdPrefix.X509Hash
+        ) {
             checkNotNull(jwt.keyId) { "keyId is missing" }
         }
         check(jwt.jwtValidity == Validity.Valid) { "jwt is not yet valid or expired" }
@@ -129,7 +154,9 @@ class ValidatePresentationRequestImpl @Inject constructor(
 
     private fun ClientIdentifier.prefixMatchesType(type: VerificationProcessType) =
         when (type) {
-            VerificationProcessType.NETWORK -> clientIdPrefix == ClientIdentifier.ClientIdPrefix.DecentralizedIdentifier
+            VerificationProcessType.NETWORK ->
+                clientIdPrefix == ClientIdentifier.ClientIdPrefix.DecentralizedIdentifier ||
+                    clientIdPrefix == ClientIdentifier.ClientIdPrefix.X509Hash
             VerificationProcessType.PROXIMITY -> clientIdPrefix == ClientIdentifier.ClientIdPrefix.VerifierAttestationJwt
         }
 
@@ -138,12 +165,12 @@ class ValidatePresentationRequestImpl @Inject constructor(
             responseMode in SUPPORTED_RESPONSE_MODES &&
             (responseMode != DIRECT_POST_JWT || !clientMetaData?.jwks?.keys.isNullOrEmpty())
 
-    private suspend fun verifierAttestationTrusted(
+    private suspend fun verifyRequestObject(
         requestObject: RequestObject,
         responseUri: String?,
         state: String?,
         verificationProcessType: VerificationProcessType
-    ): Result<Boolean?, ValidatePresentationRequestError> = coroutineBinding {
+    ): Result<RequestObjectVerificationOutcome, ValidatePresentationRequestError> = coroutineBinding {
         val verificationOutcome = verifyRequestObjectSignature(
             requestObject = requestObject,
             trustedAttestationDids = environmentSetupRepository.attestationsServiceTrustedDids,
@@ -156,12 +183,43 @@ class ValidatePresentationRequestImpl @Inject constructor(
         ) {
             Err(VcSdJwtError.IssuerValidationFailed.toValidatePresentationRequestError(responseUri, state)).bind<Unit>()
         }
-        when (verificationOutcome) {
-            RequestObjectVerificationOutcome.ATTESTATION_TRUSTED -> true
-            RequestObjectVerificationOutcome.ATTESTATION_UNTRUSTED -> false
-            RequestObjectVerificationOutcome.DID_PATH -> null
+        verificationOutcome
+    }
+
+    private fun getAuthenticatedVerifier(
+        verificationProcessType: VerificationProcessType,
+        verificationOutcome: RequestObjectVerificationOutcome,
+        request: AuthorizationRequest,
+        jwt: Jwt,
+    ): AuthenticatedVerifier? {
+        if (verificationProcessType != VerificationProcessType.NETWORK) {
+            return null
+        }
+
+        return when (verificationOutcome) {
+            RequestObjectVerificationOutcome.DID_PATH -> request.clientIdentifier.clientId.takeIf { clientId ->
+                clientId.isNotBlank() && clientId.startsWith(DID_PREFIX)
+            }?.let { did -> AuthenticatedVerifier(did = did, certificateKey = null) }
+
+            RequestObjectVerificationOutcome.X509_HASH_PATH -> getCertificateVerifier(
+                jwt = jwt,
+                responseUri = request.responseUri,
+            )
+
+            else -> null
         }
     }
+
+    private fun getCertificateVerifier(jwt: Jwt, responseUri: String?): AuthenticatedVerifier? = runCatching {
+        val responseHost = checkNotNull(URI(responseUri).host)
+        val leafCertificate = jwt.x5cLeafCertificate()
+        check(leafCertificate.dnsSubjectAlternativeNames().any { it.equals(responseHost, ignoreCase = true) }) {
+            "x5c leaf certificate does not name the response_uri host"
+        }
+        leafCertificate.didSubjectAlternativeName()?.let { did ->
+            AuthenticatedVerifier(did = did, certificateKey = leafCertificate.toP256Jwk())
+        }
+    }.getOrNull()
 
     private suspend fun validateIdentityTrust(
         request: AuthorizationRequest
@@ -215,7 +273,9 @@ class ValidatePresentationRequestImpl @Inject constructor(
 
     private fun ClientIdentifier.hasSameClientId(
         clientId: String?
-    ) = clientId == null || clientId.removePrefix(ClientIdentifier.ClientIdPrefix.DecentralizedIdentifier.value + ":") == this.clientId
+    ) = clientId == null ||
+        clientId == raw ||
+        clientId.removePrefix(ClientIdentifier.ClientIdPrefix.DecentralizedIdentifier.value + ":") == this.clientId
 
     private companion object {
         const val JWT_HEADER_TYP = "oauth-authz-req+jwt"
@@ -225,5 +285,6 @@ class ValidatePresentationRequestImpl @Inject constructor(
         const val DC_API = "dc_api"
         val SUPPORTED_RESPONSE_MODES = listOf(DIRECT_POST_JWT, DC_API_JWT, DC_API)
         const val CLAIM_AUDIENCE = "aud"
+        const val DID_PREFIX = "did:"
     }
 }

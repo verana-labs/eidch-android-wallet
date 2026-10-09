@@ -25,6 +25,8 @@ import ch.admin.foitt.wallet.platform.trustRegistry.domain.model.IdentityV2Trust
 import ch.admin.foitt.wallet.platform.trustRegistry.domain.model.TrustRegistryError
 import ch.admin.foitt.wallet.platform.trustRegistry.domain.model.VerificationQueryPublicStatement
 import ch.admin.foitt.wallet.platform.trustRegistry.domain.usecase.ProcessIdentityTrustStatement
+import ch.admin.foitt.wallet.platform.veranaTrust.VeranaDevnetFixtures
+import ch.admin.foitt.wallet.platform.veranaTrust.domain.usecase.IsVeranaTrusted
 import ch.admin.foitt.wallet.util.SafeJsonTestInstance
 import ch.admin.foitt.wallet.util.assertErrorType
 import ch.admin.foitt.wallet.util.assertOk
@@ -37,12 +39,14 @@ import io.mockk.every
 import io.mockk.impl.annotations.MockK
 import io.mockk.impl.annotations.SpyK
 import io.mockk.mockk
+import io.mockk.spyk
 import io.mockk.unmockkAll
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.encodeToJsonElement
 import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNull
@@ -76,6 +80,9 @@ class ValidatePresentationRequestImplTest {
     private lateinit var mockValidateVerificationQueryPublicStatement: ValidateVerificationQueryPublicStatement
 
     @MockK
+    private lateinit var mockIsVeranaTrusted: IsVeranaTrusted
+
+    @MockK
     private lateinit var mockIdentityTrustStatement: IdentityV2TrustStatement
 
     @SpyK
@@ -96,6 +103,7 @@ class ValidatePresentationRequestImplTest {
             verifyRequestObjectSignature = mockVerifyRequestObjectSignature,
             getActorEnvironment = mockGetActorEnvironment,
             validateVqPs = mockValidateVerificationQueryPublicStatement,
+            isVeranaTrusted = mockIsVeranaTrusted,
         )
 
         setupDefaultMocks()
@@ -207,6 +215,7 @@ class ValidatePresentationRequestImplTest {
         val result = useCase(VerificationProcessType.PROXIMITY, mockRequestObject).assertOk()
 
         assertEquals(false, result.verifierAttestationTrusted)
+        assertNull(result.authenticatedVerifierDid)
     }
 
     @Test
@@ -353,6 +362,68 @@ class ValidatePresentationRequestImplTest {
     }
 
     @Test
+    fun `DID_PATH verification outcome carries the normalized authenticated verifier DID`() = runTest {
+        coEvery { mockVerifyRequestObjectSignature(any(), any()) } returns Ok(RequestObjectVerificationOutcome.DID_PATH)
+
+        val result = useCase(VerificationProcessType.NETWORK, mockRequestObject).assertOk()
+        assertNull(result.verifierAttestationTrusted)
+        assertEquals("did:example:12345", result.authenticatedVerifierDid)
+        assertEquals(mockPresentationJwt.rawJwt, result.rawPresentationRequest)
+    }
+
+    @Test
+    fun `X509_HASH_PATH carries the DID and key of the devnet verifier certificate`() = runTest {
+        val devnetJwt = spyk(Jwt(VeranaDevnetFixtures.verifierRequestObjectJwt))
+        every { devnetJwt.jwtValidity } returns Validity.Valid
+        coEvery { mockRequestObject.jwt } returns devnetJwt
+        coEvery { mockRequestObject.clientId } returns devnetJwt.payloadJson.getValue("client_id").jsonPrimitive.content
+        coEvery {
+            mockVerifyRequestObjectSignature(any(), any())
+        } returns Ok(RequestObjectVerificationOutcome.X509_HASH_PATH)
+        coEvery { mockProcessIdentityTrustStatement(null, any()) } returns Ok(null)
+
+        val result = useCase(VerificationProcessType.NETWORK, mockRequestObject).assertOk()
+
+        assertEquals(VeranaDevnetFixtures.VERIFIER_DID, result.authenticatedVerifierDid)
+        assertEquals("XseqqXCfHcU0I__t3nHMdQom_S27tmyBSn-QWYeDLSw", result.authenticatedVerifierCertificateKey?.x)
+        assertEquals("yCCR2YWswqN0wLxdb0SKNtNc4Fzjg_u-USo6ujPm83E", result.authenticatedVerifierCertificateKey?.y)
+    }
+
+    @Test
+    fun `DID_PATH verification carries no certificate key`() = runTest {
+        coEvery { mockVerifyRequestObjectSignature(any(), any()) } returns Ok(RequestObjectVerificationOutcome.DID_PATH)
+
+        val result = useCase(VerificationProcessType.NETWORK, mockRequestObject).assertOk()
+
+        assertNull(result.authenticatedVerifierCertificateKey)
+    }
+
+    @Test
+    fun `raw DID client identifier is carried after DID_PATH verification`() = runTest {
+        val rawDid = "did:example:raw"
+        val payloadJson = MockPresentationRequest.authorizationRequestWithoutVqPS.toJsonObject().toMutableMap().apply {
+            put("client_id", JsonPrimitive(rawDid))
+        }.let { JsonObject(it) }
+        every { mockPresentationJwt.payloadJson } returns payloadJson
+        coEvery { mockRequestObject.clientId } returns rawDid
+        coEvery { mockGetActorEnvironment(rawDid) } returns ActorEnvironment.PRODUCTION
+        coEvery { mockProcessIdentityTrustStatement(any(), rawDid) } returns Ok(null)
+
+        val result = useCase(VerificationProcessType.NETWORK, mockRequestObject).assertOk()
+
+        assertEquals(rawDid, result.authenticatedVerifierDid)
+    }
+
+    @Test
+    fun `DID_PATH proximity verification never carries an authenticated Verana verifier DID`() = runTest {
+        mockProximity(requestVerificationOutcome = RequestObjectVerificationOutcome.DID_PATH)
+
+        val result = useCase(VerificationProcessType.PROXIMITY, mockRequestObject).assertOk()
+
+        assertNull(result.authenticatedVerifierDid)
+    }
+
+    @Test
     fun `ATTESTATION_UNTRUSTED verification outcome over network returns an UnknownVerifier error`() = runTest {
         coEvery {
             mockVerifyRequestObjectSignature(any(), any())
@@ -459,6 +530,21 @@ class ValidatePresentationRequestImplTest {
     }
 
     @Test
+    fun `Verifier with EXTERNAL actor environment that Verana trusts returns presentation request`() = runTest {
+        coEvery { mockGetActorEnvironment(any()) } returns ActorEnvironment.EXTERNAL
+        coEvery { mockIsVeranaTrusted(CLIENT_ID) } returns true
+
+        useCase(VerificationProcessType.NETWORK, mockRequestObject).assertOk()
+    }
+
+    @Test
+    fun `Verifier in the Swiss registry never asks Verana`() = runTest {
+        useCase(VerificationProcessType.NETWORK, mockRequestObject).assertOk()
+
+        coVerify(exactly = 0) { mockIsVeranaTrusted(any()) }
+    }
+
+    @Test
     fun `Proximity request without DCQL query returns an invalid presentation error`() = runTest {
         val authRequest = MockPresentationRequest.authorizationRequestDcApi.copy(dcqlQuery = null)
         every { mockPresentationJwt.payloadJson } returns authRequest.toJsonObject()
@@ -508,6 +594,7 @@ class ValidatePresentationRequestImplTest {
         } returns Ok(RequestObjectVerificationOutcome.DID_PATH)
 
         coEvery { mockGetActorEnvironment(CLIENT_ID) } returns ActorEnvironment.PRODUCTION
+        coEvery { mockIsVeranaTrusted(any()) } returns false
 
         val vqPS = mockk<VerificationQueryPublicStatement> {
             every { request.scope } returns SCOPE

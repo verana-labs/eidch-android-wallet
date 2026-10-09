@@ -15,6 +15,7 @@ import ch.admin.foitt.wallet.feature.presentationRequest.presentation.model.Pres
 import ch.admin.foitt.wallet.platform.activityList.domain.usecase.SavePresentationAcceptedActivity
 import ch.admin.foitt.wallet.platform.activityList.domain.usecase.SavePresentationDeclinedActivity
 import ch.admin.foitt.wallet.platform.actorMetadata.domain.model.ActorMetaDataError
+import ch.admin.foitt.wallet.platform.actorMetadata.domain.model.FetchAndCacheVerifierDisplayDataError
 import ch.admin.foitt.wallet.platform.actorMetadata.domain.usecase.FetchAndCacheVerifierDisplayData
 import ch.admin.foitt.wallet.platform.actorMetadata.domain.usecase.GetActorForScope
 import ch.admin.foitt.wallet.platform.actorMetadata.presentation.adapter.GetActorUiState
@@ -49,6 +50,8 @@ import ch.admin.foitt.wallet.platform.trustRegistry.domain.usecase.ProcessVerifi
 import ch.admin.foitt.wallet.platform.utils.launchWithDelayedLoading
 import ch.admin.foitt.wallet.platform.utils.openLink
 import ch.admin.foitt.wallet.platform.utils.trackCompletion
+import ch.admin.foitt.wallet.platform.veranaTrust.domain.model.VeranaVerifierTrustContext
+import ch.admin.foitt.wallet.platform.veranaTrust.domain.model.blocksAccept
 import com.github.michaelbull.result.annotation.UnsafeResultErrorAccess
 import com.github.michaelbull.result.mapBoth
 import com.github.michaelbull.result.onErr
@@ -58,7 +61,9 @@ import dagger.assisted.AssistedFactory
 import dagger.assisted.AssistedInject
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.emptyFlow
@@ -122,6 +127,13 @@ class PresentationRequestViewModel @AssistedInject constructor(
     private val _showUntrustedRequestBottomSheet: MutableStateFlow<Boolean> = MutableStateFlow(false)
     val showUntrustedRequestBottomSheet = _showUntrustedRequestBottomSheet.asStateFlow()
 
+    private val _isPresentationRequestLoading = MutableStateFlow(true)
+    private val _isVeranaTrustLoading = MutableStateFlow(true)
+    private var veranaTrustFetchJob: Job? = null
+    private var veranaTrustFetchGeneration = 0
+    val isLoading = _isPresentationRequestLoading.asStateFlow()
+    val isVeranaTrustLoading = _isVeranaTrustLoading.asStateFlow()
+
     @OptIn(UnsafeResultErrorAccess::class)
     val presentationRequestUiState = refreshableStateFlow(PresentationRequestUiState.EMPTY) {
         val pvaTSResult = processVerificationAuthorizationTrustStatement(
@@ -148,7 +160,7 @@ class PresentationRequestViewModel @AssistedInject constructor(
         ).mapNotNull { result ->
             result.mapBoth(
                 success = { presentationRequestUi ->
-                    _isLoading.value = false
+                    _isPresentationRequestLoading.value = false
                     presentationRequestUi.toUiState()
                 },
                 failure = {
@@ -158,9 +170,6 @@ class PresentationRequestViewModel @AssistedInject constructor(
             )
         }
     }
-
-    private val _isLoading = MutableStateFlow(true)
-    val isLoading = _isLoading.asStateFlow()
 
     private val _isSubmitting = MutableStateFlow(false)
     val isSubmitting = _isSubmitting.asStateFlow()
@@ -191,40 +200,12 @@ class PresentationRequestViewModel @AssistedInject constructor(
     }
 
     init {
-        viewModelScope.launch {
-            fetchAndCacheVerifierDisplayData(
-                presentationRequestWithRaw.authorizationRequest,
-                presentationRequestWithRaw.verificationProcessType,
-                presentationRequestWithRaw.verifierAttestationTrusted,
-            ).onErr { error ->
-                when (error) {
-                    is ActorMetaDataError.UnverifiedVerifier -> {
-                        navManager.replaceCurrentWith(
-                            Destination.GenericErrorScreen(
-                                GenericErrorScreenState.Presentation.unverifiedVerifier(
-                                    responseUri = error.responseUri,
-                                    state = presentationRequestWithRaw.authorizationRequest.state,
-                                )
-                            )
-                        )
-                    }
-                    is ActorMetaDataError.UnknownRegistry -> {
-                        navManager.replaceCurrentWith(
-                            Destination.GenericErrorScreen(
-                                GenericErrorScreenState.General.unknownRegistry(
-                                    responseUri = error.responseUri,
-                                    state = presentationRequestWithRaw.authorizationRequest.state,
-                                )
-                            )
-                        )
-                    }
-                    else -> {}
-                }
-            }
-        }
+        fetchVerifierDisplayData()
     }
 
     fun onAccept() {
+        if (_isVeranaTrustLoading.value || verifierDisplayData.value.veranaTrustEvidence.blocksAccept) return
+
         when {
             isActorReported -> _showConfirmationBottomSheet.value = true
             !presentationRequestWithRaw.hasVerifiedQuery -> _showUntrustedRequestBottomSheet.value = true
@@ -242,6 +223,8 @@ class PresentationRequestViewModel @AssistedInject constructor(
     }
 
     fun submit() {
+        if (_isVeranaTrustLoading.value || verifierDisplayData.value.veranaTrustEvidence.blocksAccept) return
+
         viewModelScope.launchWithDelayedLoading(
             isLoadingFlow = _showDelayReason,
             delay = DELAY_REASON_DURATION
@@ -326,6 +309,82 @@ class PresentationRequestViewModel @AssistedInject constructor(
             }
         }
     }
+
+    fun onVeranaTrustDetails() {
+        val evidence = verifierDisplayData.value.veranaTrustEvidence ?: return
+        navManager.navigateTo(Destination.VeranaTrustDetailsScreen(evidence))
+    }
+
+    fun onRetryVeranaTrust() {
+        fetchVerifierDisplayData()
+    }
+
+    private fun fetchVerifierDisplayData() {
+        val generation = ++veranaTrustFetchGeneration
+        veranaTrustFetchJob?.cancel()
+        veranaTrustFetchJob = viewModelScope.launch {
+            _isVeranaTrustLoading.value = true
+            try {
+                fetchAndCacheVerifierDisplayData(
+                    presentationRequestWithRaw.authorizationRequest,
+                    presentationRequestWithRaw.verificationProcessType,
+                    presentationRequestWithRaw.verifierAttestationTrusted,
+                    veranaTrustContext(),
+                ).onErr { error ->
+                    if (generation == veranaTrustFetchGeneration) {
+                        onVerifierDisplayDataError(error)
+                    }
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Throwable) {
+                if (generation == veranaTrustFetchGeneration) {
+                    navigateToErrorScreen()
+                }
+            } finally {
+                if (generation == veranaTrustFetchGeneration) {
+                    _isVeranaTrustLoading.value = false
+                }
+            }
+        }
+    }
+
+    private fun onVerifierDisplayDataError(error: FetchAndCacheVerifierDisplayDataError) {
+        when (error) {
+            is ActorMetaDataError.UnverifiedVerifier -> {
+                navManager.replaceCurrentWith(
+                    Destination.GenericErrorScreen(
+                        GenericErrorScreenState.Presentation.unverifiedVerifier(
+                            responseUri = error.responseUri,
+                            state = presentationRequestWithRaw.authorizationRequest.state,
+                        )
+                    )
+                )
+            }
+            is ActorMetaDataError.UnknownRegistry -> {
+                navManager.replaceCurrentWith(
+                    Destination.GenericErrorScreen(
+                        GenericErrorScreenState.General.unknownRegistry(
+                            responseUri = error.responseUri,
+                            state = presentationRequestWithRaw.authorizationRequest.state,
+                        )
+                    )
+                )
+            }
+            else -> {}
+        }
+    }
+
+    private fun veranaTrustContext(): VeranaVerifierTrustContext? =
+        presentationRequestWithRaw.authenticatedVerifierDid
+            ?.takeIf { it.isNotBlank() }
+            ?.let { authenticatedDid ->
+                VeranaVerifierTrustContext(
+                    authenticatedVerifierDid = authenticatedDid,
+                    certificateKey = presentationRequestWithRaw.authenticatedVerifierCertificateKey,
+                    credentialId = compatibleCredential.credentialId,
+                )
+            }
 
     private fun navigateToSuccess(redirectUri: String?) {
         navManager.replaceCurrentWith(

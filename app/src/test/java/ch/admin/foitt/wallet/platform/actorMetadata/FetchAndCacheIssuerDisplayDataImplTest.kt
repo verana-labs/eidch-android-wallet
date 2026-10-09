@@ -3,6 +3,7 @@ package ch.admin.foitt.wallet.platform.actorMetadata
 import android.webkit.URLUtil
 import ch.admin.foitt.openid4vc.domain.model.anycredential.AnyCredential
 import ch.admin.foitt.wallet.platform.actorMetadata.domain.model.ActorMetaDataError
+import ch.admin.foitt.wallet.platform.actorMetadata.domain.usecase.ActorUpdateGate
 import ch.admin.foitt.wallet.platform.actorMetadata.domain.usecase.CacheIssuerDisplayData
 import ch.admin.foitt.wallet.platform.actorMetadata.domain.usecase.FetchAndCacheIssuerDisplayData
 import ch.admin.foitt.wallet.platform.actorMetadata.domain.usecase.implementation.FetchAndCacheIssuerDisplayDataImpl
@@ -26,6 +27,11 @@ import ch.admin.foitt.wallet.platform.trustRegistry.domain.model.TrustCheckResul
 import ch.admin.foitt.wallet.platform.trustRegistry.domain.model.TrustRegistryError
 import ch.admin.foitt.wallet.platform.trustRegistry.domain.usecase.ProcessIdentityTrustStatement
 import ch.admin.foitt.wallet.platform.utils.compress
+import ch.admin.foitt.wallet.platform.veranaTrust.domain.model.VeranaTrustEvidence
+import ch.admin.foitt.wallet.platform.veranaTrust.domain.model.VeranaTrustResolution
+import ch.admin.foitt.wallet.platform.veranaTrust.domain.model.VeranaTrustRole
+import ch.admin.foitt.wallet.platform.veranaTrust.domain.model.VeranaTrustStatus
+import ch.admin.foitt.wallet.platform.veranaTrust.domain.usecase.EvaluateVeranaTrust
 import ch.admin.foitt.wallet.util.SafeJsonTestInstance
 import ch.admin.foitt.wallet.util.assertErrorType
 import ch.admin.foitt.wallet.util.assertOk
@@ -39,6 +45,7 @@ import io.mockk.coVerifyOrder
 import io.mockk.every
 import io.mockk.impl.annotations.MockK
 import io.mockk.just
+import io.mockk.mockk
 import io.mockk.mockkStatic
 import io.mockk.unmockkAll
 import kotlinx.coroutines.test.runTest
@@ -64,6 +71,9 @@ class FetchAndCacheIssuerDisplayDataImplTest {
 
     @MockK
     private lateinit var mockFetchTrustForIssuance: FetchTrustForIssuance
+
+    @MockK
+    private lateinit var mockEvaluateVeranaTrust: EvaluateVeranaTrust
 
     @MockK
     private lateinit var mockCredentialIssuerDisplayRepo: CredentialIssuerDisplayRepo
@@ -103,8 +113,10 @@ class FetchAndCacheIssuerDisplayDataImplTest {
             credentialRepository = mockCredentialRepo,
             processIdentityTrustStatement = mockProcessIdentityTrustStatement,
             fetchTrustForIssuance = mockFetchTrustForIssuance,
+            evaluateVeranaTrust = mockEvaluateVeranaTrust,
             credentialIssuerDisplayRepo = mockCredentialIssuerDisplayRepo,
             cacheIssuerDisplayData = mockCacheIssuerDisplayData,
+            actorUpdateGate = ActorUpdateGate(),
         )
 
         setupDefaultMocks()
@@ -133,11 +145,18 @@ class FetchAndCacheIssuerDisplayDataImplTest {
                 issuerDid = ISSUER_DID,
                 vcSchemaId = VC_SCHEMA_ID,
             )
+            mockEvaluateVeranaTrust(
+                role = VeranaTrustRole.ISSUER,
+                did = ISSUER_DID,
+                vct = null,
+                certificateKey = null,
+            )
             mockCredentialIssuerDisplayRepo.getIssuerDisplays(credentialId = CREDENTIAL_ID)
             mockCacheIssuerDisplayData(
                 trustCheckResult = mockTrustedTrustCheckResult,
                 issuerDisplays = any(),
                 nonComplianceData = nonComplianceData,
+                veranaTrustEvidence = veranaTrustEvidence,
             )
         }
     }
@@ -170,6 +189,7 @@ class FetchAndCacheIssuerDisplayDataImplTest {
                 trustCheckResult = any(),
                 issuerDisplays = expectedIssuerDisplays,
                 nonComplianceData = any(),
+                veranaTrustEvidence = veranaTrustEvidence,
             )
         }
     }
@@ -205,6 +225,7 @@ class FetchAndCacheIssuerDisplayDataImplTest {
                 trustCheckResult = any(),
                 issuerDisplays = expectedIssuerDisplays,
                 nonComplianceData = any(),
+                veranaTrustEvidence = veranaTrustEvidence,
             )
         }
     }
@@ -240,6 +261,7 @@ class FetchAndCacheIssuerDisplayDataImplTest {
                 trustCheckResult = any(),
                 issuerDisplays = expectedIssuerDisplays,
                 nonComplianceData = any(),
+                veranaTrustEvidence = veranaTrustEvidence,
             )
         }
     }
@@ -344,11 +366,72 @@ class FetchAndCacheIssuerDisplayDataImplTest {
     @Test
     fun `A caching exception is not caught`() = runTest {
         coEvery {
-            mockCacheIssuerDisplayData(any(), any(), any())
+            mockCacheIssuerDisplayData(any(), any(), any(), any())
         } throws IllegalStateException("my exception")
 
         assertThrows<IllegalStateException> {
             useCase(CREDENTIAL_ID)
+        }
+    }
+
+    @Test
+    fun `Verana evaluates the issuer of a single-issuer bundle once`() = runTest {
+        val secondCredential = mockk<AnyCredential>()
+        every { secondCredential.issuer } returns ISSUER_DID
+        every { secondCredential.vcSchemaId } returns VC_SCHEMA_ID_2
+        coEvery {
+            mockGetAllAnyCredentialByCredentialId(CREDENTIAL_ID)
+        } returns Ok(listOf(mockAnyCredential, secondCredential, mockAnyCredential))
+
+        useCase(CREDENTIAL_ID).assertOk()
+
+        coVerify(exactly = 1) {
+            mockEvaluateVeranaTrust(
+                role = VeranaTrustRole.ISSUER,
+                did = ISSUER_DID,
+                vct = null,
+                certificateKey = null,
+            )
+        }
+    }
+
+    @Test
+    fun `mixed verified credential issuers are unverified without asking Verana`() = runTest {
+        val secondCredential = mockk<AnyCredential>()
+        every { secondCredential.issuer } returns OTHER_ISSUER_DID
+        every { secondCredential.vcSchemaId } returns VC_SCHEMA_ID_2
+        coEvery {
+            mockGetAllAnyCredentialByCredentialId(CREDENTIAL_ID)
+        } returns Ok(listOf(mockAnyCredential, secondCredential))
+
+        useCase(CREDENTIAL_ID).assertOk()
+
+        coVerify(exactly = 0) { mockEvaluateVeranaTrust(any(), any(), any(), any()) }
+        coVerify {
+            mockCacheIssuerDisplayData(
+                trustCheckResult = any(),
+                issuerDisplays = any(),
+                nonComplianceData = any(),
+                veranaTrustEvidence = match { it.resolution.status == VeranaTrustStatus.UNVERIFIED },
+            )
+        }
+    }
+
+    @Test
+    fun `an issuer without a DID keeps the normal flow`() = runTest {
+        every { mockAnyCredential.issuer } returns "https://issuer.example"
+        coEvery { mockProcessIdentityTrustStatement(any(), any()) } returns Ok(mockIdentityTrustStatement)
+
+        useCase(CREDENTIAL_ID).assertOk()
+
+        coVerify(exactly = 0) { mockEvaluateVeranaTrust(any(), any(), any(), any()) }
+        coVerify {
+            mockCacheIssuerDisplayData(
+                trustCheckResult = any(),
+                issuerDisplays = any(),
+                nonComplianceData = any(),
+                veranaTrustEvidence = null,
+            )
         }
     }
 
@@ -366,8 +449,11 @@ class FetchAndCacheIssuerDisplayDataImplTest {
             mockCredentialIssuerDisplayRepo.getIssuerDisplays(credentialId = any())
         } returns Ok(listOf(issuerDisplayData1))
         coEvery {
-            mockCacheIssuerDisplayData(any(), any(), any())
+            mockCacheIssuerDisplayData(any(), any(), any(), any())
         } just Runs
+        coEvery {
+            mockEvaluateVeranaTrust(any(), any(), any(), any())
+        } returns veranaTrustEvidence
 
         every { mockAnyCredential.id } returns CREDENTIAL_ID
         every { mockAnyCredential.issuer } returns ISSUER_DID
@@ -386,8 +472,10 @@ class FetchAndCacheIssuerDisplayDataImplTest {
 
     private companion object {
         const val CREDENTIAL_ID = 1L
-        const val ISSUER_DID = "issuer did"
+        const val ISSUER_DID = "did:web:issuer.example"
+        const val OTHER_ISSUER_DID = "did:web:other.example"
         const val VC_SCHEMA_ID = "vcSchemaId"
+        const val VC_SCHEMA_ID_2 = "vcSchemaId2"
         const val DISPLAY_LOCALE1 = "displayLocale1"
         const val DISPLAY_LOCALE2 = "displayLocale2"
         const val TRUST_ISSUER_NAME1 = "trustIssuerName1"
@@ -512,5 +600,13 @@ class FetchAndCacheIssuerDisplayDataImplTest {
             "$displayJson\"credential_endpoint\":",
         )
         val compressedIssuerCredentialInfoWithDisplay = issuerCredentialInfoWithDisplay.toByteArray().compress()
+
+        val veranaTrustEvidence = VeranaTrustEvidence(
+            role = VeranaTrustRole.ISSUER,
+            did = ISSUER_DID,
+            vct = null,
+            resolution = VeranaTrustResolution(did = ISSUER_DID, status = VeranaTrustStatus.TRUSTED),
+            accreditation = null,
+        )
     }
 }

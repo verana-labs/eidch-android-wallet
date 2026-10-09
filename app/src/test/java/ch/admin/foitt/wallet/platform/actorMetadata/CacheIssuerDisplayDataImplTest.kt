@@ -16,6 +16,10 @@ import ch.admin.foitt.wallet.platform.trustRegistry.domain.model.IdentityV2Trust
 import ch.admin.foitt.wallet.platform.trustRegistry.domain.model.TrustCheckResult
 import ch.admin.foitt.wallet.platform.trustRegistry.domain.model.TrustStatus
 import ch.admin.foitt.wallet.platform.trustRegistry.domain.model.VcSchemaTrustStatus
+import ch.admin.foitt.wallet.platform.veranaTrust.domain.model.VeranaTrustEvidence
+import ch.admin.foitt.wallet.platform.veranaTrust.domain.model.VeranaTrustResolution
+import ch.admin.foitt.wallet.platform.veranaTrust.domain.model.VeranaTrustRole
+import ch.admin.foitt.wallet.platform.veranaTrust.domain.model.VeranaTrustStatus
 import io.mockk.MockKAnnotations
 import io.mockk.coEvery
 import io.mockk.coVerify
@@ -168,6 +172,31 @@ class CacheIssuerDisplayDataImplTest {
         }
 
         assertEquals(VcSchemaTrustStatus.UNPROTECTED, capturedDisplayData.captured.vcSchemaTrustStatus)
+    }
+
+    @Test
+    fun `Verana evidence is attached without changing Swiss trust fields`() = runTest {
+        val trustCheckResult = TrustCheckResult(
+            identityTrustStatement = mockIdentityTrustStatement,
+            vcSchemaTrustStatus = VcSchemaTrustStatus.TRUSTED,
+            nonComplianceData = nonComplianceData,
+        )
+        val evidence = VeranaTrustEvidence(
+            role = VeranaTrustRole.ISSUER,
+            did = "did:web:issuer.example",
+            vct = "https://schemas.example/credential",
+            resolution = VeranaTrustResolution(did = "did:web:issuer.example", status = VeranaTrustStatus.TRUSTED),
+            accreditation = null,
+        )
+
+        useCase(trustCheckResult, credentialIssuerDisplays, nonComplianceData, evidence)
+
+        val capturedDisplayData = slot<ActorDisplayData>()
+        coVerify {
+            mockInitializeActorForScope.invoke(actorDisplayData = capture(capturedDisplayData), any())
+        }
+        assertEquals(TrustStatus.TRUSTED, capturedDisplayData.captured.trustStatus)
+        assertEquals(evidence, capturedDisplayData.captured.veranaTrustEvidence)
     }
 
     //region mock data

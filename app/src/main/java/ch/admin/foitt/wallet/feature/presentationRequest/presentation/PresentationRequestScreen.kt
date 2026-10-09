@@ -66,6 +66,8 @@ import ch.admin.foitt.wallet.platform.trustRegistry.domain.model.ActorCompliance
 import ch.admin.foitt.wallet.platform.trustRegistry.domain.model.TrustStatus
 import ch.admin.foitt.wallet.platform.trustRegistry.domain.model.VcSchemaTrustStatus
 import ch.admin.foitt.wallet.platform.utils.TestTags
+import ch.admin.foitt.wallet.platform.veranaTrust.domain.model.blocksAccept
+import ch.admin.foitt.wallet.platform.veranaTrust.presentation.VeranaTrustCard
 import ch.admin.foitt.wallet.theme.Sizes
 import ch.admin.foitt.wallet.theme.WalletTexts
 import ch.admin.foitt.wallet.theme.WalletTheme
@@ -129,6 +131,7 @@ fun PresentationRequestScreen(viewModel: PresentationRequestViewModel) {
         verifierUiState = verifierUiState,
         presentationRequestUiState = presentationRequestUiState,
         isLoading = viewModel.isLoading.collectAsStateWithLifecycle().value,
+        isVeranaTrustLoading = viewModel.isVeranaTrustLoading.collectAsStateWithLifecycle().value,
         isSubmitting = viewModel.isSubmitting.collectAsStateWithLifecycle().value,
         submissionProgress = viewModel.proximitySubmissionProgress.collectAsStateWithLifecycle().value,
         showDelayReason = viewModel.showDelayReason.collectAsStateWithLifecycle().value,
@@ -136,7 +139,9 @@ fun PresentationRequestScreen(viewModel: PresentationRequestViewModel) {
         onDecline = viewModel::onDecline,
         onActorNameTap = viewModel::onActorNameTap,
         onReportedActorInfo = viewModel::onReportedActorInfo,
-        onBadge = viewModel::onBadge
+        onBadge = viewModel::onBadge,
+        onVeranaTrustDetails = viewModel::onVeranaTrustDetails,
+        onRetryVeranaTrust = viewModel::onRetryVeranaTrust,
     )
 }
 
@@ -145,6 +150,7 @@ private fun PresentationRequestContent(
     verifierUiState: ActorUiState,
     presentationRequestUiState: PresentationRequestUiState,
     isLoading: Boolean,
+    isVeranaTrustLoading: Boolean,
     isSubmitting: Boolean,
     submissionProgress: Double?,
     showDelayReason: Boolean,
@@ -152,7 +158,9 @@ private fun PresentationRequestContent(
     onDecline: () -> Unit,
     onActorNameTap: () -> Unit,
     onReportedActorInfo: () -> Unit,
-    onBadge: (BadgeType) -> Unit
+    onBadge: (BadgeType) -> Unit,
+    onVeranaTrustDetails: () -> Unit,
+    onRetryVeranaTrust: () -> Unit,
 ) {
     Box(
         modifier = Modifier
@@ -181,12 +189,15 @@ private fun PresentationRequestContent(
             ContentList(
                 verifierUiState = verifierUiState,
                 presentationRequestUiState = presentationRequestUiState,
+                isVeranaTrustLoading = isVeranaTrustLoading,
                 modifier = modifier,
                 onSubmit = onSubmit,
                 onDecline = onDecline,
                 onActorNameTap = onActorNameTap,
                 onReportedActorInfo = onReportedActorInfo,
-                onBadge = onBadge
+                onBadge = onBadge,
+                onVeranaTrustDetails = onVeranaTrustDetails,
+                onRetryVeranaTrust = onRetryVeranaTrust,
             )
         }
 
@@ -285,12 +296,15 @@ private fun IsSubmittingContent(
 private fun ContentList(
     verifierUiState: ActorUiState,
     presentationRequestUiState: PresentationRequestUiState,
+    isVeranaTrustLoading: Boolean,
     modifier: Modifier,
     onActorNameTap: () -> Unit,
     onReportedActorInfo: () -> Unit,
     onBadge: (BadgeType) -> Unit,
     onSubmit: () -> Unit,
     onDecline: () -> Unit,
+    onVeranaTrustDetails: () -> Unit,
+    onRetryVeranaTrust: () -> Unit,
 ) {
     var buttonsHeight by remember { mutableStateOf(0.dp) }
 
@@ -316,6 +330,17 @@ private fun ContentList(
                     verifierUiState = verifierUiState,
                     onActorNameTap = onActorNameTap,
                     onReportedActorInfo = onReportedActorInfo
+                )
+            }
+            item {
+                VeranaTrustCard(
+                    evidence = verifierUiState.veranaTrustEvidence,
+                    isLoading = isVeranaTrustLoading,
+                    onOpenDetails = onVeranaTrustDetails,
+                    onRetry = onRetryVeranaTrust,
+                    partyName = verifierUiState.name,
+                    credentialName = presentationRequestUiState.credentialCardState.title,
+                    modifier = Modifier.padding(horizontal = Sizes.s04, vertical = Sizes.s02),
                 )
             }
             item { Spacer(modifier = Modifier.height(Sizes.s04)) }
@@ -345,6 +370,7 @@ private fun ContentList(
         Buttons(
             onDecline = onDecline,
             onAccept = onSubmit,
+            isAcceptEnabled = !isVeranaTrustLoading && !verifierUiState.veranaTrustEvidence.blocksAccept,
             onHeightMeasured = { buttonsHeight = it },
             modifier = Modifier
                 .fillMaxWidth(maxWidth)
@@ -395,6 +421,7 @@ private fun LoadingIndicator(
 private fun Buttons(
     onDecline: () -> Unit,
     onAccept: () -> Unit,
+    isAcceptEnabled: Boolean,
     onHeightMeasured: (Dp) -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -410,6 +437,7 @@ private fun Buttons(
                         text = stringResource(id = R.string.tk_present_review_button_accept),
                         startIcon = painterResource(id = R.drawable.wallet_ic_checkmark),
                         onClick = onAccept,
+                        enabled = isAcceptEnabled,
                     )
                 },
                 {
@@ -465,6 +493,7 @@ private fun PresentationRequestScreenPreview() {
                 showsUnregisteredRequestCallout = true
             ),
             isLoading = false,
+            isVeranaTrustLoading = false,
             isSubmitting = false,
             submissionProgress = 0.5,
             showDelayReason = false,
@@ -472,7 +501,9 @@ private fun PresentationRequestScreenPreview() {
             onDecline = {},
             onActorNameTap = {},
             onReportedActorInfo = {},
-            onBadge = {}
+            onBadge = {},
+            onVeranaTrustDetails = {},
+            onRetryVeranaTrust = {},
         )
     }
 }

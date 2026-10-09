@@ -13,6 +13,7 @@ import ch.admin.foitt.openid4vc.domain.model.credentialoffer.TokenResponse
 import ch.admin.foitt.openid4vc.domain.model.keyBinding.KeyBindingType
 import ch.admin.foitt.openid4vc.domain.model.payloadEncryption.PayloadEncryption
 import ch.admin.foitt.openid4vc.domain.model.payloadEncryption.PayloadEncryptionKeyPair
+import ch.admin.foitt.openid4vc.domain.model.vcSdJwt.VcSdJwtError
 import ch.admin.foitt.openid4vc.domain.repository.CredentialOfferRepository
 import ch.admin.foitt.openid4vc.domain.usecase.jwe.DecryptJWEWithSoftwareKey
 import ch.admin.foitt.openid4vc.util.SafeJsonTestInstance
@@ -35,6 +36,7 @@ import io.ktor.client.engine.mock.MockRequestHandleScope
 import io.ktor.client.engine.mock.respond
 import io.ktor.client.request.HttpRequestData
 import io.ktor.client.request.HttpResponseData
+import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpMethod
 import io.ktor.http.HttpStatusCode
@@ -209,6 +211,126 @@ class CredentialOfferRepositoryImplTest {
         val url = URI.create("$BASE_URL/otherIssuer").toURL()
 
         repo.fetchRawAndParsedIssuerCredentialInformation(url).assertErrorType(CredentialOfferError.NetworkInfoError::class)
+    }
+
+    @Test
+    fun `Fetching JWT VC issuer metadata uses the issuer well-known path`() = runTest {
+        handler = { request ->
+            when {
+                request.isMetadataOID4VCIIssuerResponse() -> respond(
+                    status = HttpStatusCode.OK,
+                    headers = headersOf(HttpHeaders.ContentType, applicationJwt.content),
+                    content = ISSUER_METADATA_JWT_OID4VCI,
+                )
+                request.url.encodedPath == "$JWT_VC_ISSUER_METADATA_PATH$ISSUER_OIDC" -> respond(
+                    status = HttpStatusCode.OK,
+                    headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.content),
+                    content = jwtVcIssuerMetadata,
+                )
+                else -> error("Unhandled request: ${request.url} -> add in mockHttpClient")
+            }
+        }
+
+        val issuer = URI.create("$BASE_URL$ISSUER_OIDC").toURL()
+        repo.fetchRawAndParsedIssuerCredentialInformation(URI.create("$BASE_URL$ISSUER_OID4VCI").toURL()).assertOk()
+        val metadata = repo.fetchJwtVcIssuerMetadata(issuer).assertOk()
+
+        assertEquals(issuer.toString(), metadata.issuer)
+        assertEquals(1, metadata.jwks.keys.size)
+    }
+
+    @Test
+    fun `Invalid JWT VC issuer metadata fails closed`() = runTest {
+        handler = { request ->
+            when {
+                request.isMetadataOID4VCIIssuerResponse() -> respond(
+                    status = HttpStatusCode.OK,
+                    headers = headersOf(HttpHeaders.ContentType, applicationJwt.content),
+                    content = ISSUER_METADATA_JWT_OID4VCI,
+                )
+                request.url.encodedPath == JWT_VC_ISSUER_METADATA_PATH -> respond(
+                    status = HttpStatusCode.OK,
+                    headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.content),
+                    content = "{}",
+                )
+                else -> error("Unhandled request: ${request.url} -> add in mockHttpClient")
+            }
+        }
+
+        repo.fetchRawAndParsedIssuerCredentialInformation(URI.create("$BASE_URL$ISSUER_OID4VCI").toURL()).assertOk()
+        repo.fetchJwtVcIssuerMetadata(URI.create(BASE_URL).toURL())
+            .assertErrorType(VcSdJwtError.IssuerValidationFailed::class)
+    }
+
+    @Test
+    fun `JWT VC issuer metadata network errors are mapped`() = runTest {
+        handler = { request ->
+            when {
+                request.isMetadataOID4VCIIssuerResponse() -> respond(
+                    status = HttpStatusCode.OK,
+                    headers = headersOf(HttpHeaders.ContentType, applicationJwt.content),
+                    content = ISSUER_METADATA_JWT_OID4VCI,
+                )
+                request.url.encodedPath == JWT_VC_ISSUER_METADATA_PATH -> throw IOException("network failure")
+                else -> error("Unhandled request: ${request.url} -> add in mockHttpClient")
+            }
+        }
+
+        repo.fetchRawAndParsedIssuerCredentialInformation(URI.create("$BASE_URL$ISSUER_OID4VCI").toURL()).assertOk()
+        repo.fetchJwtVcIssuerMetadata(URI.create(BASE_URL).toURL())
+            .assertErrorType(VcSdJwtError.NetworkError::class)
+    }
+
+    @Test
+    fun `JWT VC issuer metadata must use the credential issuer origin`() = runTest {
+        handler = { request ->
+            when {
+                request.isMetadataOID4VCIIssuerResponse() -> respond(
+                    status = HttpStatusCode.OK,
+                    headers = headersOf(HttpHeaders.ContentType, applicationJwt.content),
+                    content = ISSUER_METADATA_JWT_OID4VCI,
+                )
+                else -> error("Unexpected network request: ${request.url}")
+            }
+        }
+
+        repo.fetchRawAndParsedIssuerCredentialInformation(URI.create("$BASE_URL$ISSUER_OID4VCI").toURL()).assertOk()
+
+        repo.fetchJwtVcIssuerMetadata(URI.create("https://other.example").toURL())
+            .assertErrorType(VcSdJwtError.IssuerValidationFailed::class)
+    }
+
+    @Test
+    fun `JWT VC issuer metadata redirects fail closed`() = runTest {
+        var redirectFollowed = false
+        handler = { request ->
+            when {
+                request.isMetadataOID4VCIIssuerResponse() -> respond(
+                    status = HttpStatusCode.OK,
+                    headers = headersOf(HttpHeaders.ContentType, applicationJwt.content),
+                    content = ISSUER_METADATA_JWT_OID4VCI,
+                )
+                request.url.encodedPath == JWT_VC_ISSUER_METADATA_PATH -> respond(
+                    status = HttpStatusCode.Found,
+                    headers = headersOf(HttpHeaders.Location, "https://other.example/jwt-vc-issuer"),
+                    content = "",
+                )
+                request.url.host == "other.example" -> {
+                    redirectFollowed = true
+                    respond(
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.content),
+                        content = jwtVcIssuerMetadata,
+                    )
+                }
+                else -> error("Unhandled request: ${request.url} -> add in mockHttpClient")
+            }
+        }
+
+        repo.fetchRawAndParsedIssuerCredentialInformation(URI.create("$BASE_URL$ISSUER_OID4VCI").toURL()).assertOk()
+        repo.fetchJwtVcIssuerMetadata(URI.create(BASE_URL).toURL())
+            .assertErrorType(VcSdJwtError.IssuerValidationFailed::class)
+        assertEquals(true, redirectFollowed)
     }
 
     @Test
@@ -503,6 +625,7 @@ class CredentialOfferRepositoryImplTest {
 
     private companion object {
         const val ISSUER_METADATA_PATH = "/.well-known/openid-credential-issuer"
+        const val JWT_VC_ISSUER_METADATA_PATH = "/.well-known/jwt-vc-issuer"
         const val ISSUER_CONFIG_PATH = "/.well-known/oauth-authorization-server"
         const val ISSUER_ACCEPT_LANGUAGE = "/issuerAcceptLanguage"
         const val ISSUER_OID4VCI = "/issuerOID4VCI"
@@ -590,6 +713,22 @@ class CredentialOfferRepositoryImplTest {
             accessToken = "accessToken",
             tokenType = TokenType.BEARER,
         )
+
+        val jwtVcIssuerMetadata = """
+            {
+                "issuer": "$BASE_URL$ISSUER_OIDC",
+                "jwks": {
+                    "keys": [
+                        {
+                            "kty": "EC",
+                            "crv": "P-256",
+                            "x": "x",
+                            "y": "y"
+                        }
+                    ]
+                }
+            }
+        """.trimIndent()
 
         val verifiableCredentialResponseJson = """
             {

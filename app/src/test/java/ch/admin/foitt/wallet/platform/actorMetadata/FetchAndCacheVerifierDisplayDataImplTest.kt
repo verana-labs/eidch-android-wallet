@@ -1,16 +1,20 @@
 package ch.admin.foitt.wallet.platform.actorMetadata
 
+import ch.admin.foitt.openid4vc.domain.model.anycredential.AnyCredential
+import ch.admin.foitt.openid4vc.domain.model.jwk.Jwk
 import ch.admin.foitt.openid4vc.domain.model.presentationRequest.AuthorizationRequest
 import ch.admin.foitt.openid4vc.domain.model.presentationRequest.ClientIdentifier
 import ch.admin.foitt.openid4vc.domain.model.presentationRequest.ClientMetaData
 import ch.admin.foitt.openid4vc.domain.model.presentationRequest.ClientName
 import ch.admin.foitt.openid4vc.domain.model.presentationRequest.LogoUri
+import ch.admin.foitt.openid4vc.domain.model.vcSdJwt.VcSdJwtCredential
 import ch.admin.foitt.wallet.platform.actorEnvironment.domain.model.ActorEnvironment
 import ch.admin.foitt.wallet.platform.actorEnvironment.domain.usecase.GetActorEnvironment
 import ch.admin.foitt.wallet.platform.actorMetadata.domain.model.ActorDisplayData
 import ch.admin.foitt.wallet.platform.actorMetadata.domain.model.ActorField
 import ch.admin.foitt.wallet.platform.actorMetadata.domain.model.ActorMetaDataError
 import ch.admin.foitt.wallet.platform.actorMetadata.domain.model.ActorType
+import ch.admin.foitt.wallet.platform.actorMetadata.domain.usecase.ActorUpdateGate
 import ch.admin.foitt.wallet.platform.actorMetadata.domain.usecase.FetchAndCacheVerifierDisplayData
 import ch.admin.foitt.wallet.platform.actorMetadata.domain.usecase.FetchTrustForVerification
 import ch.admin.foitt.wallet.platform.actorMetadata.domain.usecase.InitializeActorForScope
@@ -18,6 +22,7 @@ import ch.admin.foitt.wallet.platform.actorMetadata.domain.usecase.implementatio
 import ch.admin.foitt.wallet.platform.actorMetadata.mock.ActorMetadataMocks.actorComplianceState
 import ch.admin.foitt.wallet.platform.actorMetadata.mock.ActorMetadataMocks.nonComplianceData
 import ch.admin.foitt.wallet.platform.actorMetadata.mock.ActorMetadataMocks.nonComplianceReasons
+import ch.admin.foitt.wallet.platform.credential.domain.usecase.GetAllAnyCredentialsByCredentialId
 import ch.admin.foitt.wallet.platform.credentialPresentation.domain.model.VerificationProcessType
 import ch.admin.foitt.wallet.platform.database.domain.model.DisplayLanguage
 import ch.admin.foitt.wallet.platform.navigation.domain.model.ComponentScope
@@ -28,6 +33,12 @@ import ch.admin.foitt.wallet.platform.trustRegistry.domain.model.TrustRegistryEr
 import ch.admin.foitt.wallet.platform.trustRegistry.domain.model.TrustStatus
 import ch.admin.foitt.wallet.platform.trustRegistry.domain.model.VcSchemaTrustStatus
 import ch.admin.foitt.wallet.platform.trustRegistry.domain.usecase.ProcessIdentityV1TrustStatement
+import ch.admin.foitt.wallet.platform.veranaTrust.domain.model.VeranaTrustEvidence
+import ch.admin.foitt.wallet.platform.veranaTrust.domain.model.VeranaTrustResolution
+import ch.admin.foitt.wallet.platform.veranaTrust.domain.model.VeranaTrustRole
+import ch.admin.foitt.wallet.platform.veranaTrust.domain.model.VeranaTrustStatus
+import ch.admin.foitt.wallet.platform.veranaTrust.domain.model.VeranaVerifierTrustContext
+import ch.admin.foitt.wallet.platform.veranaTrust.domain.usecase.EvaluateVeranaTrust
 import ch.admin.foitt.wallet.util.assertErrorType
 import ch.admin.foitt.wallet.util.assertOk
 import com.github.michaelbull.result.Err
@@ -39,14 +50,19 @@ import io.mockk.coVerifyOrder
 import io.mockk.every
 import io.mockk.impl.annotations.MockK
 import io.mockk.just
+import io.mockk.mockk
 import io.mockk.runs
 import io.mockk.slot
 import io.mockk.unmockkAll
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import uniffi.heidi_dcql_rust.CredentialQuery
+import uniffi.heidi_dcql_rust.DcqlQuery
+import uniffi.heidi_dcql_rust.Meta
 
 class FetchAndCacheVerifierDisplayDataImplTest {
     @MockK
@@ -70,6 +86,15 @@ class FetchAndCacheVerifierDisplayDataImplTest {
     @MockK
     private lateinit var mockFetchTrustForVerification: FetchTrustForVerification
 
+    @MockK
+    private lateinit var mockGetAllAnyCredentialsByCredentialId: GetAllAnyCredentialsByCredentialId
+
+    @MockK
+    private lateinit var mockEvaluateVeranaTrust: EvaluateVeranaTrust
+
+    @MockK
+    private lateinit var mockAnyCredential: AnyCredential
+
     private lateinit var useCase: FetchAndCacheVerifierDisplayData
 
     @BeforeEach
@@ -79,6 +104,9 @@ class FetchAndCacheVerifierDisplayDataImplTest {
             getActorEnvironment = mockGetActorEnvironment,
             initializeActorForScope = mockInitializeActorForScope,
             fetchTrustForVerification = mockFetchTrustForVerification,
+            getAllAnyCredentialsByCredentialId = mockGetAllAnyCredentialsByCredentialId,
+            evaluateVeranaTrust = mockEvaluateVeranaTrust,
+            actorUpdateGate = ActorUpdateGate(),
         )
 
         setupDefaultMocks()
@@ -484,10 +512,133 @@ class FetchAndCacheVerifierDisplayDataImplTest {
         ).assertErrorType(ActorMetaDataError.Unexpected::class)
     }
 
+    @Test
+    fun `final presentation evaluates the authenticated DID against the requested vct`() = runTest {
+        useCase(
+            authorizationRequest = mockAuthorizationRequest,
+            verificationProcessType = VerificationProcessType.NETWORK,
+            verifierAttestationTrusted = null,
+            veranaTrustContext = trustContext(),
+        )
+
+        coVerify(exactly = 0) { mockGetAllAnyCredentialsByCredentialId(any()) }
+        coVerify(exactly = 1) {
+            mockEvaluateVeranaTrust(
+                role = VeranaTrustRole.VERIFIER,
+                did = AUTHENTICATED_DID,
+                vct = vcSchemaId,
+                certificateKey = CERTIFICATE_KEY,
+            )
+        }
+        val capturedDisplayData = slot<ActorDisplayData>()
+        coVerify {
+            mockInitializeActorForScope(capture(capturedDisplayData), ComponentScope.Verifier)
+        }
+        assertEquals(veranaTrustEvidence, capturedDisplayData.captured.veranaTrustEvidence)
+    }
+
+    @Test
+    fun `an ambiguous request is checked against the vct of the shared credential`() = runTest {
+        every { mockAuthorizationRequest.dcqlQuery } returns dcqlQuery(OTHER_VCT, SHARED_VCT)
+        val sharedCredential = mockk<VcSdJwtCredential>()
+        every { sharedCredential.vct } returns SHARED_VCT
+        coEvery {
+            mockGetAllAnyCredentialsByCredentialId(CREDENTIAL_ID)
+        } returns Ok(listOf(sharedCredential))
+
+        useCase(
+            authorizationRequest = mockAuthorizationRequest,
+            verificationProcessType = VerificationProcessType.NETWORK,
+            verifierAttestationTrusted = null,
+            veranaTrustContext = trustContext(),
+        )
+
+        coVerify(exactly = 1) {
+            mockEvaluateVeranaTrust(
+                role = VeranaTrustRole.VERIFIER,
+                did = AUTHENTICATED_DID,
+                vct = SHARED_VCT,
+                certificateKey = CERTIFICATE_KEY,
+            )
+        }
+    }
+
+    @Test
+    fun `an ambiguous request without a matching shared credential is checked without a vct`() = runTest {
+        every { mockAuthorizationRequest.dcqlQuery } returns dcqlQuery(OTHER_VCT, SHARED_VCT)
+        coEvery {
+            mockGetAllAnyCredentialsByCredentialId(CREDENTIAL_ID)
+        } returns Err(mockk())
+
+        useCase(
+            authorizationRequest = mockAuthorizationRequest,
+            verificationProcessType = VerificationProcessType.NETWORK,
+            verifierAttestationTrusted = null,
+            veranaTrustContext = trustContext(),
+        )
+
+        coVerify(exactly = 1) {
+            mockEvaluateVeranaTrust(
+                role = VeranaTrustRole.VERIFIER,
+                did = AUTHENTICATED_DID,
+                vct = null,
+                certificateKey = CERTIFICATE_KEY,
+            )
+        }
+    }
+
+    @Test
+    fun `credential-list and proximity calls never evaluate Verana`() = runTest {
+        useCase(mockAuthorizationRequest, VerificationProcessType.NETWORK, null)
+        useCase(
+            mockAuthorizationRequest,
+            VerificationProcessType.PROXIMITY,
+            true,
+            trustContext(),
+        )
+
+        coVerify(exactly = 0) { mockGetAllAnyCredentialsByCredentialId(any()) }
+        coVerify(exactly = 0) { mockEvaluateVeranaTrust(any(), any(), any(), any()) }
+    }
+
+    @Test
+    fun `a verifier without a DID keeps the normal flow`() = runTest {
+        useCase(
+            authorizationRequest = mockAuthorizationRequest,
+            verificationProcessType = VerificationProcessType.NETWORK,
+            verifierAttestationTrusted = null,
+            veranaTrustContext = trustContext(did = "https://verifier.example"),
+        )
+
+        coVerify(exactly = 0) { mockEvaluateVeranaTrust(any(), any(), any(), any()) }
+        val capturedDisplayData = slot<ActorDisplayData>()
+        coVerify {
+            mockInitializeActorForScope(capture(capturedDisplayData), ComponentScope.Verifier)
+        }
+        assertNull(capturedDisplayData.captured.veranaTrustEvidence)
+    }
+
+    private fun trustContext(did: String = AUTHENTICATED_DID) = VeranaVerifierTrustContext(
+        authenticatedVerifierDid = did,
+        certificateKey = CERTIFICATE_KEY,
+        credentialId = CREDENTIAL_ID,
+    )
+
+    private fun dcqlQuery(vararg vcts: String) = DcqlQuery(
+        credentials = listOf(
+            CredentialQuery(
+                id = "id",
+                format = "dc+sd-jwt",
+                meta = Meta.SdjwtVc(vctValues = vcts.toList()),
+            )
+        )
+    )
+
     private fun setupDefaultMocks() {
         every { mockAuthorizationRequest.clientIdentifier } returns mockClientIdentifier
         every { mockClientIdentifier.clientId } returns clientId
         every { mockAuthorizationRequest.clientMetaData } returns mockClientMetadata
+        every { mockAuthorizationRequest.dcqlQuery } returns dcqlQuery(vcSchemaId)
 
         every { mockIdentityTrustStatement.entityName } returns mockTrustedNames
 
@@ -503,6 +654,14 @@ class FetchAndCacheVerifierDisplayDataImplTest {
 
         coEvery { mockProcessIdentityV1TrustStatement(clientId) } returns Ok(mockIdentityTrustStatement)
 
+        every { mockAnyCredential.vcSchemaId } returns STORED_SCHEMA_ID
+        coEvery {
+            mockGetAllAnyCredentialsByCredentialId(CREDENTIAL_ID)
+        } returns Ok(listOf(mockAnyCredential))
+        coEvery {
+            mockEvaluateVeranaTrust(any(), any(), any(), any())
+        } returns veranaTrustEvidence
+
         coEvery {
             mockInitializeActorForScope.invoke(any(), componentScope = ComponentScope.Verifier)
         } just runs
@@ -510,6 +669,25 @@ class FetchAndCacheVerifierDisplayDataImplTest {
 
     //region mock data
     private val clientId = "clientId1"
+    private val vcSchemaId = "vcSchemaId"
+
+    private companion object {
+        const val AUTHENTICATED_DID = "did:web:verifier.example"
+        const val CREDENTIAL_ID = 42L
+        const val STORED_SCHEMA_ID = "https://schemas.example/stored"
+        const val SHARED_VCT = "https://schemas.example/vct/shared"
+        const val OTHER_VCT = "https://schemas.example/vct/other"
+        val CERTIFICATE_KEY = Jwk(x = "x", y = "y", crv = "P-256", kty = "EC")
+
+        val veranaTrustEvidence = VeranaTrustEvidence(
+            role = VeranaTrustRole.VERIFIER,
+            did = AUTHENTICATED_DID,
+            vct = null,
+            resolution = VeranaTrustResolution(did = AUTHENTICATED_DID, status = VeranaTrustStatus.TRUSTED),
+            accreditation = null,
+        )
+    }
+
     private val trustRegistryError = Err(TrustRegistryError.Unexpected(IllegalStateException("error")))
 
     private val mockTrustedNames = mapOf(
